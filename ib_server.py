@@ -94,6 +94,7 @@ MANAGED_REPRICE_THRESHOLD_DEFAULT = config.getfloat('execution', 'managed_repric
 MANAGED_REPRICE_INTERVAL_SECONDS = config.getfloat('execution', 'managed_reprice_interval_seconds', fallback=2.0)
 MANAGED_REPRICE_MAX_UPDATES = config.getint('execution', 'managed_reprice_max_updates', fallback=12)
 MANAGED_REPRICE_TIMEOUT_SECONDS = config.getfloat('execution', 'managed_reprice_timeout_seconds', fallback=600.0)
+MARKET_DATA_TYPE = config.getint('market_data', 'data_type', fallback=3)
 HISTORICAL_SQLITE_DB = os.path.abspath(
     config.get('historical', 'sqlite_db_path', fallback=os.path.join('sqlite_spy', 'spy_options.db'))
 )
@@ -651,8 +652,8 @@ async def connect_ib():
             logging.info(f"Connecting to IB TWS/Gateway at {TWS_HOST}:{TWS_PORT} (Client ID: {client_id})...")
             await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=client_id, timeout=20)
             logging.info(f"Successfully connected to IB (Client ID: {client_id}).")
-            # Enforce Real-Time Data (1)
-            ib.reqMarketDataType(1)
+            # Market data type configured in config.ini [market_data] data_type
+            ib.reqMarketDataType(MARKET_DATA_TYPE)
             logging.info("Managed accounts available: %s", ', '.join(_get_managed_accounts()) or '<none>')
             _broadcast_managed_accounts_snapshot()
         except Exception as e:
