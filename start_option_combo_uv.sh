@@ -16,12 +16,19 @@ uv sync
 RUNTIME_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$RUNTIME_DIR"
 HTTP_LOG="$RUNTIME_DIR/http_server.log"
-IB_LOG="$RUNTIME_DIR/ib_server.log"
+
+# Pick the live data source backend: futu (default, free research mode) | ibkr.
+DATA_SOURCE="${DATA_SOURCE:-futu}"
+case "$DATA_SOURCE" in
+    futu) BACKEND_SCRIPT="futu_server.py"; IB_LOG="$RUNTIME_DIR/futu_server.log" ;;
+    ibkr) BACKEND_SCRIPT="ib_server.py";   IB_LOG="$RUNTIME_DIR/ib_server.log" ;;
+    *)    echo "ERROR: unknown DATA_SOURCE '$DATA_SOURCE' (expected futu or ibkr)." >&2; exit 1 ;;
+esac
 
 uv run python -m http.server 8000 >>"$HTTP_LOG" 2>&1 &
 HTTP_PID=$!
 
-uv run python ib_server.py >>"$IB_LOG" 2>&1 &
+uv run python "$BACKEND_SCRIPT" >>"$IB_LOG" 2>&1 &
 IB_PID=$!
 
 cleanup() {
@@ -34,9 +41,9 @@ trap cleanup EXIT INT TERM
 
 echo "Started (managed by uv):"
 echo "  - Frontend: http://localhost:8000/index.html?entry=live&marketDataMode=live&lockMarketDataMode=1"
-echo "  - IB bridge: ws://localhost:8765"
+echo "  - Data bridge ($DATA_SOURCE -> $BACKEND_SCRIPT): ws://localhost:8765"
 echo
-echo "PIDs:   http=$HTTP_PID  ib_server=$IB_PID"
+echo "PIDs:   http=$HTTP_PID  backend=$IB_PID"
 echo
 echo "Logs:"
 echo "  - $HTTP_LOG"
