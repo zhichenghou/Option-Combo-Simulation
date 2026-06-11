@@ -1,14 +1,17 @@
-# Futu Live Data + IBKR Option Backfill — Operations
+# Fork Notes — Local Additions & Upstream Sync
 
-This document covers the fork-local additions that sit alongside the upstream
-project. Keeping it in `docs/` minimizes merge conflicts with upstream files.
+This document is the single reference for everything this fork adds on top of
+the upstream project (`xuzhe35/Option-Combo-Simulation`), plus how to keep the
+fork in sync with upstream. Keeping these notes in `docs/` minimizes merge
+conflicts with upstream files.
 
-It explains how to:
+Fork-local features covered here:
 
 1. run the Futu live market-data backend (`futu_server.py`)
 2. switch the live data source between Futu and IBKR
 3. backfill historical option data into `spy_options.db` from IBKR (`scripts/backfill_options_ibkr.py`)
 4. understand the relevant subscription tiers and known limits
+5. keep this fork synchronized with upstream (see §8)
 
 For the original design rationale and non-goals, see `FUTU_INTEGRATION_PLAN.md`.
 
@@ -195,3 +198,69 @@ Pure-logic unit tests run offline (no FutuOpenD / no IBKR needed):
 uv run python -m unittest tests.symbol_mapping_test
 uv run python -m unittest tests.backfill_options_ibkr_test
 ```
+
+---
+
+## 8. Keeping this fork in sync with upstream
+
+Upstream lives at `xuzhe35/Option-Combo-Simulation`. Your fork's `origin` is
+`zhichenghou/Option-Combo-Simulation`. Local feature work happens on `uv`.
+
+### One-time setup (already done)
+
+```bash
+git remote add upstream git@github.com:xuzhe35/Option-Combo-Simulation.git
+git remote -v   # origin -> your fork, upstream -> xuzhe35
+```
+
+### Routine sync
+
+1. Fetch upstream:
+
+   ```bash
+   git fetch upstream
+   ```
+
+2. Fast-forward your `main` to match upstream (keeps it clean):
+
+   ```bash
+   git checkout main
+   git merge --ff-only upstream/main
+   git push origin main
+   ```
+
+   If `--ff-only` fails, you have local commits on `main`; use
+   `git merge upstream/main` and resolve conflicts.
+
+3. Bring upstream changes into the working branch `uv` (merge is safest because
+   `uv` is already pushed):
+
+   ```bash
+   git checkout uv
+   git merge upstream/main
+   # resolve conflicts -> git add <files> -> git commit
+   git push origin uv
+   ```
+
+   Rebase is an alternative for a linear history, but rewrites commits and needs
+   `git push --force-with-lease`; avoid it if others use the branch.
+
+### Conflict-avoidance conventions used by this fork
+
+- New features go in **new files** (`futu_server.py`, `symbol_mapping.py`,
+  `scripts/backfill_options_ibkr.py`, this doc) instead of editing upstream
+  files, so most upstream merges apply cleanly.
+- Edits to shared upstream files are kept small and localized:
+  - `config.ini`: added `[market_data].live_source` and the `[futu]` section.
+  - `start_option_combo_uv.sh`: `DATA_SOURCE` switch selecting the backend.
+- `.DS_Store` is git-ignored; never commit it back.
+
+### Check divergence at any time
+
+```bash
+git fetch upstream
+git rev-list --left-right --count uv...upstream/main
+# left  = commits unique to uv (your work)
+# right = upstream commits you still need to merge (0 = fully synced)
+```
+
