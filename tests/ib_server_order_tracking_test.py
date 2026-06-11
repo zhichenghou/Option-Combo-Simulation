@@ -12,12 +12,15 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from ib_server_order_tracking import (  # noqa: E402
+    build_active_combo_orders_snapshot,
     build_active_hedge_orders_snapshot,
     build_combo_order_error_handler,
     build_combo_order_exec_details_handler,
     build_combo_order_status_handler,
     build_hedge_order_exec_details_handler,
     build_hedge_order_status_handler,
+    is_terminal_combo_tracking,
+    upsert_combo_order_tracking,
 )
 
 
@@ -357,3 +360,257 @@ class IbServerOrderTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload['orders']), 1)
         self.assertEqual(payload['orders'][0]['orderId'], 700)
         self.assertEqual(active_tracking['websocket'], new_websocket)
+
+    async def test_combo_fill_recorded_while_tracking_orphaned(self):
+        env, sent_messages, _execution_engine = self._build_env()
+        tracking = {
+            'websocket': None,
+            'groupId': 'group_orphan',
+            'groupName': 'Orphan Combo',
+            'executionMode': 'submit',
+            'executionIntent': 'open',
+            'requestSource': 'trial_trigger',
+            'orderId': 910,
+            'permId': 911,
+            'legs': [
+                {
+                    'id': 'leg_call',
+                    'conId': 111,
+                    'localSymbol': 'SPY  240621C00500000',
+                    'symbol': 'SPY',
+                    'secType': 'OPT',
+                    'right': 'C',
+                    'strike': 500,
+                    'expDate': '20240621',
+                    'targetPosition': 1,
+                    'expectedExecutionSide': 'BOT',
+                },
+            ],
+            'fillTotals': {},
+            'seenExecIds': set(),
+        }
+        env['combo_order_tracking_by_order_id'][910] = tracking
+        env['combo_order_tracking_by_perm_id'][911] = tracking
+
+        trade = SimpleNamespace(
+            order=SimpleNamespace(orderId=910),
+            orderStatus=SimpleNamespace(permId=911),
+            contract=SimpleNamespace(secType='OPT', conId=111),
+        )
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(orderId=910, permId=911, execId='orphan-fill-1', shares=1, price=2.5, side='BOT'),
+            contract=SimpleNamespace(secType='OPT', conId=111),
+        )
+
+        handler = build_combo_order_exec_details_handler(env)
+        handler(trade, fill)
+        await asyncio.sleep(0)
+
+        self.assertEqual(sent_messages, [])
+        self.assertEqual(tracking['fillTotals']['leg_call']['filledQuantity'], 1.0)
+        self.assertEqual(tracking['fillTotals']['leg_call']['filledNotional'], 2.5)
+
+        new_websocket = object()
+        snapshot = build_active_combo_orders_snapshot(env, new_websocket, None)
+        await asyncio.sleep(0)
+
+        self.assertEqual(snapshot['action'], 'active_combo_orders_snapshot')
+        self.assertEqual(len(snapshot['orders']), 1)
+        self.assertEqual(snapshot['orders'][0]['groupId'], 'group_orphan')
+        self.assertIs(tracking['websocket'], new_websocket)
+
+        # The fills accumulated while orphaned must be replayed to the
+        # re-attached session so leg costs are written back.
+        fill_messages = [
+            payload for ws, payload in sent_messages
+            if ws is new_websocket and payload.get('action') == 'combo_order_fill_cost_update'
+        ]
+        self.assertEqual(len(fill_messages), 1)
+        replayed_legs = fill_messages[0]['orderFill']['legs']
+        self.assertEqual(len(replayed_legs), 1)
+        self.assertEqual(replayed_legs[0]['id'], 'leg_call')
+        self.assertEqual(replayed_legs[0]['avgFillPrice'], 2.5)
+        self.assertEqual(replayed_legs[0]['filledQuantity'], 1.0)
+
+    def test_upsert_combo_order_tracking_preserves_fills_across_passes(self):
+        env, _sent_messages, _execution_engine = self._build_env()
+        websocket = object()
+        legs = [{'id': 'leg_call', 'conId': 121, 'expectedExecutionSide': 'BOT'}]
+
+        pre_registered = upsert_combo_order_tracking(
+            env,
+            websocket=websocket,
+            group_id='group_upsert',
+            group_name='Upsert Combo',
+            account='ACC-1',
+            execution_mode='submit',
+            execution_intent='open',
+            request_source='trial_trigger',
+            order_id=920,
+            perm_id=None,
+            status='PendingSubmit',
+            legs=legs,
+        )
+
+        pre_registered['fillTotals']['leg_call'] = {
+            'filledQuantity': 1.0,
+            'filledNotional': 2.5,
+        }
+        pre_registered['seenExecIds'].add('early-fill-1')
+
+        merged = upsert_combo_order_tracking(
+            env,
+            websocket=websocket,
+            group_id='group_upsert',
+            group_name='Upsert Combo',
+            account='ACC-1',
+            execution_mode='submit',
+            execution_intent='open',
+            request_source='trial_trigger',
+            order_id=920,
+            perm_id=921,
+            status='Submitted',
+            status_message='Order accepted.',
+            legs=legs,
+        )
+
+        self.assertIs(merged, pre_registered)
+        self.assertEqual(merged['fillTotals']['leg_call']['filledQuantity'], 1.0)
+        self.assertIn('early-fill-1', merged['seenExecIds'])
+        self.assertEqual(merged['status'], 'Submitted')
+        self.assertEqual(merged['statusMessage'], 'Order accepted.')
+        self.assertIs(env['combo_order_tracking_by_order_id'][920], merged)
+        self.assertIs(env['combo_order_tracking_by_perm_id'][921], merged)
+
+    async def test_active_combo_snapshot_pushes_terminal_state_and_drops_tracking(self):
+        env, sent_messages, _execution_engine = self._build_env()
+        new_websocket = object()
+        live_tracking = {
+            'websocket': None,
+            'groupId': 'group_live',
+            'groupName': 'Live Combo',
+            'executionMode': 'submit',
+            'executionIntent': 'open',
+            'requestSource': 'trial_trigger',
+            'orderId': 930,
+            'permId': 931,
+            'status': 'Submitted',
+        }
+        terminal_tracking = {
+            'websocket': None,
+            'groupId': 'group_done',
+            'groupName': 'Done Combo',
+            'executionMode': 'submit',
+            'executionIntent': 'open',
+            'requestSource': 'trial_trigger',
+            'orderId': 932,
+            'permId': 933,
+            'status': 'Filled',
+            'legs': [
+                {
+                    'id': 'leg_done',
+                    'conId': 201,
+                    'localSymbol': 'SPY  240621C00510000',
+                    'symbol': 'SPY',
+                    'secType': 'OPT',
+                    'right': 'C',
+                    'strike': 510,
+                    'expDate': '20240621',
+                    'targetPosition': 1,
+                    'expectedExecutionSide': 'BOT',
+                },
+            ],
+            'fillTotals': {
+                'leg_done': {'filledQuantity': 1.0, 'filledNotional': 3.4},
+            },
+            'seenExecIds': {'done-fill-1'},
+        }
+        env['combo_order_tracking_by_order_id'][930] = live_tracking
+        env['combo_order_tracking_by_perm_id'][931] = live_tracking
+        env['combo_order_tracking_by_order_id'][932] = terminal_tracking
+        env['combo_order_tracking_by_perm_id'][933] = terminal_tracking
+
+        self.assertFalse(is_terminal_combo_tracking(env, live_tracking))
+        self.assertTrue(is_terminal_combo_tracking(env, terminal_tracking))
+
+        snapshot = build_active_combo_orders_snapshot(env, new_websocket, None)
+        await asyncio.sleep(0)
+
+        self.assertEqual(snapshot['action'], 'active_combo_orders_snapshot')
+        self.assertEqual(len(snapshot['orders']), 1)
+        self.assertEqual(snapshot['orders'][0]['groupId'], 'group_live')
+        self.assertIs(live_tracking['websocket'], new_websocket)
+
+        # The order that filled while disconnected delivers its final status
+        # and attributed fill costs to the reconnected session, then the
+        # tracking is dropped.
+        terminal_status_messages = [
+            payload for ws, payload in sent_messages
+            if ws is new_websocket
+            and payload.get('action') == 'combo_order_status_update'
+            and payload.get('groupId') == 'group_done'
+        ]
+        self.assertEqual(len(terminal_status_messages), 1)
+        self.assertEqual(terminal_status_messages[0]['orderStatus']['status'], 'Filled')
+
+        terminal_fill_messages = [
+            payload for ws, payload in sent_messages
+            if ws is new_websocket
+            and payload.get('action') == 'combo_order_fill_cost_update'
+            and payload.get('groupId') == 'group_done'
+        ]
+        self.assertEqual(len(terminal_fill_messages), 1)
+        self.assertEqual(terminal_fill_messages[0]['orderFill']['legs'][0]['avgFillPrice'], 3.4)
+
+        self.assertNotIn(932, env['combo_order_tracking_by_order_id'])
+        self.assertNotIn(933, env['combo_order_tracking_by_perm_id'])
+        self.assertIn(930, env['combo_order_tracking_by_order_id'])
+
+    async def test_active_combo_snapshot_does_not_steal_live_session_trackings(self):
+        env, sent_messages, _execution_engine = self._build_env()
+        owner_websocket = object()
+        other_websocket = object()
+        owned_tracking = {
+            'websocket': owner_websocket,
+            'groupId': 'group_owned',
+            'groupName': 'Owned Combo',
+            'executionMode': 'submit',
+            'executionIntent': 'open',
+            'requestSource': 'trial_trigger',
+            'orderId': 940,
+            'permId': 941,
+            'status': 'Submitted',
+            'legs': [
+                {
+                    'id': 'leg_owned',
+                    'conId': 401,
+                    'expectedExecutionSide': 'BOT',
+                },
+            ],
+            'fillTotals': {
+                'leg_owned': {'filledQuantity': 1.0, 'filledNotional': 2.0},
+            },
+            'seenExecIds': set(),
+        }
+        env['combo_order_tracking_by_order_id'][940] = owned_tracking
+        env['combo_order_tracking_by_perm_id'][941] = owned_tracking
+
+        snapshot = build_active_combo_orders_snapshot(env, other_websocket, None)
+        await asyncio.sleep(0)
+
+        # A tracking owned by another live session must stay fully with that
+        # session: no re-bind, no snapshot entry, no replayed pushes.
+        self.assertEqual(snapshot['orders'], [])
+        self.assertIs(owned_tracking['websocket'], owner_websocket)
+        self.assertEqual(sent_messages, [])
+        self.assertIn(940, env['combo_order_tracking_by_order_id'])
+
+        # The owning session itself may re-request and keeps everything.
+        snapshot = build_active_combo_orders_snapshot(env, owner_websocket, None)
+        await asyncio.sleep(0)
+        self.assertEqual(len(snapshot['orders']), 1)
+        self.assertIs(owned_tracking['websocket'], owner_websocket)
+
+
+if __name__ == '__main__':
+    unittest.main()

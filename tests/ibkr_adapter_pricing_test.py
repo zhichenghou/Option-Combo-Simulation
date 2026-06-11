@@ -127,7 +127,7 @@ class IbkrAdapterPricingTests(unittest.TestCase):
         self.assertEqual(pricing_source, 'test_guardrail')
         self.assertIn('avoid fills', note)
 
-    def test_resolve_combo_price_increment_uses_es_live_family_default(self):
+    def test_resolve_combo_price_increment_uses_default_when_es_has_no_family_increment(self):
         adapter = IbkrExecutionAdapter(
             ib=_DummyIb(),
             client_subscriptions={},
@@ -146,7 +146,7 @@ class IbkrAdapterPricingTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(adapter._resolve_combo_price_increment(request=request), 0.25)
+        self.assertEqual(adapter._resolve_combo_price_increment(request=request), 0.01)
 
     def test_build_contract_from_request_preserves_micro_fop_multipliers_without_trading_class(self):
         adapter = IbkrExecutionAdapter(
@@ -184,7 +184,7 @@ class IbkrAdapterPricingTests(unittest.TestCase):
             self.assertEqual(getattr(contract, 'multiplier', ''), multiplier)
             self.assertEqual(getattr(contract, 'tradingClass', ''), '')
 
-    def test_quantize_limit_price_respects_es_quarter_point_increment(self):
+    def test_quantize_limit_price_respects_explicit_quarter_point_increment(self):
         quantized = self.adapter._quantize_limit_price(3.18, 'BUY', 0.25)
         self.assertEqual(quantized, 3.0)
 
@@ -664,6 +664,239 @@ class IbServerExecutionDispatchTests(unittest.TestCase):
         self.assertEqual(payload['action'], 'combo_order_preview_result')
         self.assertEqual(payload['groupId'], 'group_1')
         self.assertEqual([call[0] for call in stub.calls], ['hedge', 'combo'])
+
+
+class IbkrAdapterSubmitPreRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pre_registers_combo_tracking_before_settle_sleep(self):
+        events = []
+
+        class _SubmitIb:
+            def __init__(self):
+                self.orderStatusEvent = _DummyEvent()
+
+            def placeOrder(self, contract, order):
+                events.append('place_order')
+                order.orderId = 4500
+                return SimpleNamespace(
+                    order=order,
+                    orderStatus=SimpleNamespace(
+                        permId=4501,
+                        status='PendingSubmit',
+                        filled=0,
+                        remaining=1,
+                        avgFillPrice=0,
+                        lastFillPrice=0,
+                        whyHeld='',
+                        mktCapPrice=0,
+                    ),
+                    log=[],
+                    advancedError='',
+                )
+
+        def on_combo_order_placed(websocket, request, trade, tracking_legs):
+            events.append('pre_register')
+            self.assertEqual(getattr(trade.order, 'orderId', None), 4500)
+            self.assertEqual(len(tracking_legs), 1)
+            self.assertEqual(tracking_legs[0]['id'], 'leg_1')
+            self.assertEqual(tracking_legs[0]['conId'], 12345)
+
+        adapter = IbkrExecutionAdapter(
+            ib=_SubmitIb(),
+            client_subscriptions={},
+            qualified_underlyings={},
+            supported_live_families={},
+            index_exchange_fallbacks={},
+            on_combo_order_placed=on_combo_order_placed,
+        )
+        adapter._register_managed_context = lambda *args, **kwargs: None
+
+        preview = SimpleNamespace(
+            combo_symbol='SPY',
+            combo_exchange='SMART',
+            order_action='BUY',
+            total_quantity=1,
+            limit_price=1.25,
+            raw_net_mid=1.25,
+            execution_mode='submit',
+            account='',
+            pricing_source='middle',
+            pricing_note='',
+            legs=[],
+        )
+        order = SimpleNamespace(
+            action='BUY',
+            orderType='LMT',
+            totalQuantity=1,
+            lmtPrice=1.25,
+            tif='DAY',
+            transmit=True,
+        )
+        resolved_legs = [{
+            'request': SimpleNamespace(id='leg_1', exp_date='2026-06-19'),
+            'contract': SimpleNamespace(
+                conId=12345,
+                localSymbol='SPY  260619C00500000',
+                symbol='SPY',
+                secType='OPT',
+                right='C',
+                strike=500.0,
+            ),
+            'pos': 1,
+            'ratio': 1,
+            'quote': {'bid': 1.2, 'ask': 1.3, 'mark': 1.25},
+        }]
+
+        async def fake_build(websocket, request):
+            return {
+                'comboContract': SimpleNamespace(secType='BAG'),
+                'order': order,
+                'preview': preview,
+                'resolvedLegs': resolved_legs,
+            }
+
+        adapter._build_combo_order_from_request = fake_build
+
+        request = ComboOrderRequest(
+            group_id='group_pre_reg',
+            group_name='Pre Registration',
+            underlying_symbol='SPY',
+            underlying_contract_month='',
+            execution_mode='submit',
+        )
+
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(_seconds):
+            events.append('sleep')
+            await real_sleep(0)
+
+        asyncio.sleep = fake_sleep
+        try:
+            result = await adapter.submit_combo_order(object(), request)
+        finally:
+            asyncio.sleep = real_sleep
+
+        self.assertEqual(events, ['place_order', 'pre_register', 'sleep'])
+        self.assertEqual(result.order_id, 4500)
+        self.assertEqual(result.perm_id, 4501)
+        self.assertIs(result.trade.order, order)
+
+
+class IbkrAdapterManagedAdoptionTests(unittest.TestCase):
+    def _build_adapter(self):
+        return IbkrExecutionAdapter(
+            ib=_DummyIb(),
+            client_subscriptions={},
+            qualified_underlyings={},
+            supported_live_families={},
+            index_exchange_fallbacks={},
+        )
+
+    def test_adopt_managed_combo_order_claims_only_orphaned_contexts(self):
+        adapter = self._build_adapter()
+        new_websocket = object()
+        orphan_context = {'websocket': None, 'orderId': 5100, 'permId': 5101}
+        adapter.managed_executions_by_order_id[5100] = orphan_context
+        adapter.managed_executions_by_perm_id[5101] = orphan_context
+
+        self.assertTrue(adapter.adopt_managed_combo_order(new_websocket, 5100, 5101))
+        self.assertIs(orphan_context['websocket'], new_websocket)
+        self.assertIsNone(orphan_context['lastManagedEmitSignature'])
+
+    def test_adopt_managed_combo_order_leaves_live_sessions_untouched(self):
+        adapter = self._build_adapter()
+        owner_websocket = object()
+        other_websocket = object()
+        owned_context = {'websocket': owner_websocket, 'orderId': 5200, 'permId': 5201}
+        adapter.managed_executions_by_order_id[5200] = owned_context
+        adapter.managed_executions_by_perm_id[5201] = owned_context
+
+        self.assertFalse(adapter.adopt_managed_combo_order(other_websocket, 5200, 5201))
+        self.assertIs(owned_context['websocket'], owner_websocket)
+        self.assertFalse(adapter.adopt_managed_combo_order(other_websocket, 9999, None))
+
+
+class IbServerSubmissionFillReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_record_combo_order_submission_replays_trade_fills(self):
+        websocket = object()
+        request = SimpleNamespace(
+            group_id='group_replay',
+            group_name='Replay Combo',
+            account='ACC-1',
+            execution_mode='submit',
+            execution_intent='open',
+            request_source='trial_trigger',
+        )
+        tracking_legs = [{
+            'id': 'leg_replay',
+            'conId': 301,
+            'localSymbol': 'SPY  240621C00520000',
+            'symbol': 'SPY',
+            'secType': 'OPT',
+            'right': 'C',
+            'strike': 520,
+            'expDate': '20240621',
+            'targetPosition': 1,
+            'expectedExecutionSide': 'BOT',
+            'ratio': 1,
+        }]
+        fill = SimpleNamespace(
+            execution=SimpleNamespace(
+                orderId=940,
+                permId=941,
+                execId='replay-fill-1',
+                shares=1,
+                price=4.2,
+                side='BOT',
+            ),
+            contract=SimpleNamespace(secType='OPT', conId=301),
+        )
+        trade = SimpleNamespace(
+            order=SimpleNamespace(orderId=940, account='ACC-1'),
+            orderStatus=SimpleNamespace(
+                permId=941,
+                status='Filled',
+                filled=1,
+                remaining=0,
+                avgFillPrice=4.2,
+                lastFillPrice=4.2,
+                whyHeld='',
+                mktCapPrice=0,
+            ),
+            fills=[fill],
+            log=[],
+            advancedError='',
+        )
+        result = SimpleNamespace(
+            order_id=940,
+            perm_id=941,
+            status='Filled',
+            status_message=None,
+            tracking_legs=tracking_legs,
+            trade=trade,
+        )
+
+        try:
+            # Simulate the pre-registration callback having failed: no
+            # tracking exists yet, so the live exec event for this fill was
+            # dropped. The submission record must replay it from trade.fills.
+            ib_server._record_combo_order_submission(websocket, request, result)
+            await asyncio.sleep(0)
+
+            tracking = ib_server.combo_order_tracking_by_order_id.get(940)
+            self.assertIsNotNone(tracking)
+            self.assertEqual(tracking['fillTotals']['leg_replay']['filledQuantity'], 1.0)
+            self.assertEqual(tracking['fillTotals']['leg_replay']['filledNotional'], 4.2)
+            self.assertIn('replay-fill-1', tracking['seenExecIds'])
+
+            # Replaying again must not double-count thanks to exec-id dedup.
+            ib_server._record_combo_order_submission(websocket, request, result)
+            await asyncio.sleep(0)
+            tracking = ib_server.combo_order_tracking_by_order_id.get(940)
+            self.assertEqual(tracking['fillTotals']['leg_replay']['filledQuantity'], 1.0)
+        finally:
+            ib_server.combo_order_tracking_by_order_id.pop(940, None)
+            ib_server.combo_order_tracking_by_perm_id.pop(941, None)
 
 
 if __name__ == '__main__':
