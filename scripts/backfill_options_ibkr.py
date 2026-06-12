@@ -4,9 +4,10 @@ Backfill historical option daily bars from IBKR (with an OPRA subscription)
 into the project SQLite DB so that ``historical_server.py`` can replay them.
 
 The script sweeps a grid of (expiry, strike, right) contracts for a single
-underlying, requests daily bars per contract via ``reqHistoricalDataAsync``,
-and upserts the result into ``options_data`` keyed by
-(symbol, quote_date, expiration, type, strike).
+underlying. IBKR serves no end-of-day ('1 day') history for options, so per
+contract it requests intraday (1-hour) bars via ``reqHistoricalDataAsync`` and
+collapses each trading day into one daily row, upserting into ``options_data``
+keyed by (symbol, quote_date, expiration, type, strike).
 
 Design notes:
 - Writes ``options_data`` matching the columns ``historical_data.py`` reads
@@ -244,17 +245,95 @@ def _read_tws_config() -> tuple[str, int, int]:
     return host, port, client_id
 
 
-async def _fetch_contract_daily_bars(ib, contract, *, duration: str, end_datetime: str = ''):
+INTRADAY_BAR_SIZE = '1 hour'
+
+
+async def _fetch_intraday_bars(ib, contract, *, duration: str, what_to_show: str, end_datetime: str = ''):
     return await ib.reqHistoricalDataAsync(
         contract,
         endDateTime=end_datetime,
         durationStr=duration,
-        barSizeSetting='1 day',
-        whatToShow='TRADES',
+        barSizeSetting=INTRADAY_BAR_SIZE,
+        whatToShow=what_to_show,
         useRTH=True,
         formatDate=1,
         keepUpToDate=False,
     )
+
+
+async def _fetch_contract_daily_bars(
+    ib,
+    contract,
+    *,
+    duration: str,
+    include_quotes: bool = True,
+    pacer: "HistoricalPacer | None" = None,
+    end_datetime: str = '',
+) -> list[dict]:
+    """Reconstruct daily option rows from intraday bars.
+
+    IBKR's historical service has no end-of-day ('1 day') data for options
+    (``Error 162: No data of type EODChart``), but intraday history spans the
+    contract's full life. We request 1-hour RTH bars and collapse each trading
+    day into one record: ``last``/``volume`` come from a TRADES pass; ``bid``/
+    ``ask`` from separate BID/ASK passes when ``include_quotes`` is set, and
+    ``mark`` is the bid/ask midpoint (falling back to ``last``). Returns a
+    date-sorted list of dicts ``{date, last, volume, bid, ask, mark}``.
+    ``implied_volatility`` and ``open_interest`` are not recoverable from
+    historical bars.
+    """
+    daily: dict[str, dict] = {}
+
+    def _acquire() -> None:
+        if pacer is not None:
+            pacer.acquire()
+
+    def _row(iso: str) -> dict:
+        return daily.setdefault(
+            iso, {'date': iso, 'last': None, 'volume': 0, 'bid': None, 'ask': None, 'mark': None}
+        )
+
+    _acquire()
+    trades = await _fetch_intraday_bars(
+        ib, contract, duration=duration, what_to_show='TRADES', end_datetime=end_datetime
+    )
+    for bar in trades or []:
+        iso = _bar_date_to_iso(getattr(bar, 'date', None))
+        if not iso:
+            continue
+        rec = _row(iso)
+        close = getattr(bar, 'close', None)
+        if close is not None:
+            rec['last'] = close  # bars are time-ordered; keep the day's last close
+        volume_raw = getattr(bar, 'volume', None)
+        try:
+            if volume_raw is not None and float(volume_raw) >= 0:
+                rec['volume'] += int(float(volume_raw))
+        except (TypeError, ValueError):
+            pass
+
+    if include_quotes:
+        for field, what in (('bid', 'BID'), ('ask', 'ASK')):
+            _acquire()
+            qbars = await _fetch_intraday_bars(
+                ib, contract, duration=duration, what_to_show=what, end_datetime=end_datetime
+            )
+            for bar in qbars or []:
+                iso = _bar_date_to_iso(getattr(bar, 'date', None))
+                if not iso:
+                    continue
+                close = getattr(bar, 'close', None)
+                if close is not None:
+                    _row(iso)[field] = close
+
+    for rec in daily.values():
+        bid, ask = rec['bid'], rec['ask']
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            rec['mark'] = round((bid + ask) / 2.0, 4)
+        elif rec['last'] is not None:
+            rec['mark'] = rec['last']
+
+    return [daily[iso] for iso in sorted(daily)]
 
 
 async def _backfill(args: argparse.Namespace) -> int:
@@ -308,34 +387,28 @@ async def _backfill(args: argparse.Namespace) -> int:
                     print(f"  no contract for {ticker} {expiry_iso} {strike}{right}", file=sys.stderr)
                     continue
 
-                pacer.acquire()
                 try:
-                    bars = await _fetch_contract_daily_bars(ib, qualified[0], duration=args.duration)
+                    daily_records = await _fetch_contract_daily_bars(
+                        ib, qualified[0], duration=args.duration,
+                        include_quotes=not args.no_quotes, pacer=pacer,
+                    )
                 except Exception as exc:
                     print(f"  history failed {ticker} {expiry_iso} {strike}{right}: {exc}", file=sys.stderr)
                     continue
 
                 rows: list[tuple[object, ...]] = []
-                for bar in bars or []:
-                    quote_iso = _bar_date_to_iso(getattr(bar, 'date', None))
-                    if not quote_iso:
-                        continue
-                    date_ref = _get_or_create_date_id(conn, date_cache, quote_iso)
-                    close = getattr(bar, 'close', None)
-                    volume_raw = getattr(bar, 'volume', None)
-                    try:
-                        volume = int(volume_raw) if volume_raw is not None else None
-                    except (TypeError, ValueError):
-                        volume = None
+                for rec in daily_records:
+                    date_ref = _get_or_create_date_id(conn, date_cache, rec['date'])
+                    volume = rec['volume'] if rec['volume'] else None
                     rows.append((
                         symbol_id, date_ref, expiration_ref, option_type, float(strike),
-                        None,                       # bid (TRADES has no bid/ask)
-                        None,                       # ask
-                        close,                      # mark <- close
-                        close,                      # last
-                        None,                       # implied_volatility
+                        rec['bid'],                 # bid (None unless --no-quotes off)
+                        rec['ask'],                 # ask
+                        rec['mark'],                # mark <- bid/ask mid, else last
+                        rec['last'],                # last <- day's last intraday close
+                        None,                       # implied_volatility (not in historical bars)
                         volume,
-                        None,                       # open_interest
+                        None,                       # open_interest (not in historical bars)
                         'ibkr',
                     ))
 
@@ -368,6 +441,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strike-min", type=float, required=True, help="Inclusive lowest strike.")
     parser.add_argument("--strike-max", type=float, required=True, help="Inclusive highest strike.")
     parser.add_argument("--strike-step", type=float, default=5.0, help="Strike increment. Defaults to 5.")
+    parser.add_argument("--no-quotes", action="store_true",
+                        help="Skip BID/ASK passes; backfill only last/volume from TRADES "
+                             "(1 request per contract instead of 3).")
     parser.add_argument("--right", default="both", choices=["both", "C", "P", "call", "put"],
                         help="Option right(s) to fetch. Defaults to both.")
     parser.add_argument("--exchange", default="SMART", help="Option exchange. Defaults to SMART.")
