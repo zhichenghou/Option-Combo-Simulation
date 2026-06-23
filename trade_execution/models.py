@@ -108,6 +108,7 @@ class HedgeOrderPreview:
     projected_net_delta: Optional[float] = None
     target_lower: Optional[float] = None
     target_upper: Optional[float] = None
+    price_increment: Optional[float] = None
     what_if: Optional[dict[str, Any]] = None
 
     def to_payload(self) -> dict[str, Any]:
@@ -144,6 +145,8 @@ class HedgeOrderPreview:
             payload["targetLower"] = self.target_lower
         if self.target_upper is not None:
             payload["targetUpper"] = self.target_upper
+        if self.price_increment is not None:
+            payload["priceIncrement"] = self.price_increment
         if self.what_if is not None:
             payload["whatIf"] = self.what_if
         return payload
@@ -329,8 +332,14 @@ class ComboOrderPreview:
     managed_concession_ratio: Optional[float] = None
     best_combo_price: Optional[float] = None
     worst_combo_price: Optional[float] = None
+    price_increment: Optional[float] = None
     can_concede_pricing: bool = False
     continue_action_label: Optional[str] = None
+    close_plan_stage: Optional[str] = None
+    close_plan_complete: Optional[bool] = None
+    close_plan_message: Optional[str] = None
+    assignment_adjustments: list[dict[str, Any]] = field(default_factory=list)
+    staged_orders: list[dict[str, Any]] = field(default_factory=list)
     legs: list[ComboPreviewLeg] = field(default_factory=list)
     what_if: Optional[dict[str, Any]] = None
 
@@ -377,10 +386,22 @@ class ComboOrderPreview:
             payload["bestComboPrice"] = self.best_combo_price
         if self.worst_combo_price is not None:
             payload["worstComboPrice"] = self.worst_combo_price
+        if self.price_increment is not None:
+            payload["priceIncrement"] = self.price_increment
         if self.can_concede_pricing:
             payload["canConcedePricing"] = True
         if self.continue_action_label:
             payload["continueActionLabel"] = self.continue_action_label
+        if self.close_plan_stage:
+            payload["closePlanStage"] = self.close_plan_stage
+        if self.close_plan_complete is not None:
+            payload["closePlanComplete"] = self.close_plan_complete
+        if self.close_plan_message:
+            payload["closePlanMessage"] = self.close_plan_message
+        if self.assignment_adjustments:
+            payload["assignmentAdjustments"] = self.assignment_adjustments
+        if self.staged_orders:
+            payload["stagedOrders"] = self.staged_orders
         if self.what_if is not None:
             payload["whatIf"] = self.what_if
         return payload
